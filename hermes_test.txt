@@ -1,0 +1,6 @@
+Hello from Hermes Agent!
+
+这是由 Hermes Agent (DeepSeek V4 Pro) 自动创建并推送的测试文件。
+创建时间：2026年7月18日
+
+如果你看到这个文件，说明 GitHub 上传成功了！
