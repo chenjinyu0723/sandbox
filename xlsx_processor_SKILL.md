@@ -1,12 +1,12 @@
 ---
 name: excel-processor
-description: "Use when the user wants to clean, deduplicate, filter, or transform large Excel files (multi-sheet) with Polars. Supports per-sheet dedup (AND/OR logic), null-dropping, and statistical filtering (median/mean/mode/outlier thresholds)."
-version: 1.0.0
+description: "Use when the user wants to clean, deduplicate, filter, or transform large Excel files (multi-sheet) with Polars. Supports per-sheet dedup (AND/OR logic), null-dropping, statistical filtering (median/mean/mode/outlier thresholds), and datetime-aware comparison."
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [excel, polars, xlsx, dedup, filter, data-cleaning]
+    tags: [excel, polars, xlsx, dedup, filter, data-cleaning, datetime]
     related_skills: [document-to-markdown]
 ---
 
@@ -16,7 +16,7 @@ metadata:
 
 处理超大型 Excel 文件（百万行级别），对每个子表独立执行**去重 / 去空 / 条件筛选**三个算子，输出到新的 Excel 文件。
 
-核心脚本：`scripts/xlsx_processor.py`（一个自包含的 Python 文件，~1300 行，中文注释全覆盖）
+核心脚本：`scripts/xlsx_processor.py`（一个自包含的 Python 文件，~1500 行，中文注释全覆盖）
 
 底层引擎：Polars + Calamine（FastExcel），逐表处理，控制内存。
 
@@ -26,11 +26,37 @@ metadata:
 - Excel 有多个子表，每个子表的处理规则不同
 - 数据量大（几十万行以上），担心内存爆炸
 - 筛选条件需要用到统计量（中位数、均值、众数、异常值边界）
+- 需要按**日期时间**列筛选（如"2020-12-19 之后的数据"）
 
 Don't use for:
 - 简单的单表去重（直接用 Polars `.unique()` 更简单）
 - 格式美化 / 合并单元格 / 图表（这不是数据清洗）
 - 交互式 Excel 操作（用 computer-use 打开 Excel 手动操作）
+
+## Workflow for the Agent (MANDATORY ORDER)
+
+**必须先 preview 再写配置，禁止跳过 preview 直接写配置。**
+
+```
+Step 1: 确认依赖
+  pip install polars fastexcel xlsxwriter
+
+Step 2: 运行 preview 查看 Excel 结构
+  python scripts/xlsx_processor.py --preview <input_path>
+  → 输出所有子表名 + 每列的列名&类型&样本值
+  → 与用户意图对齐，确认列名拼写和表名完全一致
+
+Step 3: 根据 preview 结果写 JSON 配置
+  按下方 Configuration Structure 写出配置文件。
+  列名必须与 preview 输出完全一致（含空格、大小写）。
+
+Step 4: 正式执行
+  python scripts/xlsx_processor.py --config <config_path>
+  → 脚本输出逐步骤的处理行数和保留率
+
+Step 5: 报告结果
+  引用脚本输出的汇总信息（输入/输出行数、保留率、输出路径）
+```
 
 ## Quick Start
 
@@ -38,17 +64,15 @@ Don't use for:
 # 1. 确认依赖
 pip install polars fastexcel xlsxwriter
 
-# 2. 看懂配置结构（生成示例文件）
-python scripts/xlsx_processor.py --generate-example config.example.json
+# 2. 先看 Excel 里有什么（子表名、列名、类型）
+python scripts/xlsx_processor.py --preview "C:/data/原始.xlsx"
 
-# 3. 按需修改配置
-#    编辑 config.example.json → 改成自己的 input_path 和 sheets 配置
+# 3. 根据 preview 输出写配置，或生成模板再改
+python scripts/xlsx_processor.py --generate-example config.json
+# 编辑 config.json → 改成自己的 input_path 和 sheets 配置
 
-# 4. 先 dry-run 验证配置
-python scripts/xlsx_processor.py --config config.example.json --dry-run
-
-# 5. 正式执行
-python scripts/xlsx_processor.py --config config.example.json
+# 4. 正式执行
+python scripts/xlsx_processor.py --config config.json
 ```
 
 ## Configuration Structure
@@ -108,6 +132,17 @@ python scripts/xlsx_processor.py --config config.example.json
 | `outlier_lower` | Q1 - 1.5×IQR（下异常值边界）        |
 | `outlier_upper` | Q3 + 1.5×IQR（上异常值边界）        |
 
+**datetime 智能适配**：
+当 filter 的列是日期/时间类型时，`value_type="literal"` 的 `value` 会自动解析为 datetime。
+支持以下格式（缺毫秒、缺时分秒、缺时间部分均可）：
+- `"2020-12-19 15:19:27.000000"`（完整）
+- `"2020-12-19 15:19:27"`（缺毫秒）
+- `"2020-12-19"`（仅日期，自动补 00:00:00）
+- `"2020/12/19"`（斜杠分隔）
+- `"2020-12-19T15:19:27"`（ISO 8601）
+
+**无需手动指定类型**，脚本自动检测列是否为时间类型并解析。
+
 **2. drop_nulls — 删除含空值行**
 
 ```json
@@ -135,33 +170,30 @@ python scripts/xlsx_processor.py --config config.example.json
 | `and` | 列值**组合**相同 → 重复 | ("张三","100") 与 ("张三","100") 重复 → 保留第一行 |
 | `or`  | 任一列的值**独立**出现过 → 删除 | A="张三"在第1行见过 → 后续有"张三"的行全删；B=100在第2行见过 → 后续有100的行全删 |
 
-## Workflow for the Agent
-
-1. **理解需求**：用户会描述对哪些表、哪些列做什么操作（去重/去空/筛选）
-2. **写 JSON 配置**：按上面结构写出配置文件，参考 `scripts/xlsx_processor.py` 头部注释
-3. **dry-run 验证**：`python scripts/xlsx_processor.py --config <config> --dry-run`
-4. **正式执行**：`python scripts/xlsx_processor.py --config <config>`
-5. **报告结果**：脚本会输出详细的处理前后行数、保留率
-
-If the user does NOT provide a config file path, generate one based on their description, then run it.
-
 ## Common Pitfalls
 
-1. **列名不匹配**：Excel 表头与 config 中的 `column` 必须严格一致（含空格、大小写）。如果列名对不上，脚本会报 `KeyError` 并列出前 10 个可用列名。
+1. **列名不匹配**：Excel 表头与 config 中的 `column` 必须严格一致。**必须先跑 `--preview` 确认列名**，避免写错。如果列名对不上，脚本会报 `KeyError` 并列出前 10 个可用列名。
 2. **统计量计算失败**：如果整列都是 null 或非数值，`median/mean/outlier_*` 会报错。先用 `drop_nulls` 或换 `literal` 模式。
-3. **"or" 去重太激进**：独立去重可能删掉大量行，建议先用 `--dry-run` 看配置是否合理，或先用小样试验。
+3. **"or" 去重太激进**：独立去重可能删掉大量行。建议先用小数据试验理解逻辑。
 4. **内存警告**：单表超过 500MB 时脚本会打印 WARNING。如果确实 OOM，建议先转 parquet 再处理。
 5. **输出覆盖**：如果输出文件已存在，脚本会打印警告并直接覆盖。确认路径正确。
+6. **datetime 解析失败**：如果列是时间类型但 `value` 无法解析，脚本会打印 WARNING 并尝试直接比较（通常会失败）。检查 value 格式是否在支持列表中。
 
 ## Verification Checklist
 
 - [ ] `pip install polars fastexcel xlsxwriter` 全部安装成功
-- [ ] `--dry-run` 通过，无 ValidationError
+- [ ] 已运行 `--preview` 确认子表名和列名
+- [ ] 配置中的列名与 preview 输出完全一致
 - [ ] 输出文件生成在预期路径
 - [ ] 输出子表数量、名称、顺序与原表一致（skip 的除外）
 - [ ] 抽查 3-5 行验证去重/去空/筛选逻辑正确
 
 ## One-Shot Recipes
+
+### 预览 Excel 结构
+```bash
+python scripts/xlsx_processor.py --preview "C:/data/原始.xlsx"
+```
 
 ### 全表去重（组合列）
 ```json
@@ -183,6 +215,17 @@ If the user does NOT provide a config file path, generate one based on their des
   ]
 }
 ```
+
+### 筛选 2020-12-19 之后的数据（datetime 自动解析）
+```json
+{
+  "type": "filter", "logic": "and",
+  "conditions": [
+    {"column": "创建时间", "operator": ">", "value_type": "literal", "value": "2020-12-19"}
+  ]
+}
+```
+说明：脚本自动检测"创建时间"列是 datetime 类型，把 `"2020-12-19"` 解析为 `2020-12-19 00:00:00`，无需手动处理格式。
 
 ### 筛选金额不在异常值范围内的行（剔除异常值）
 ```json

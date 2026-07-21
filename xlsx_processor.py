@@ -190,6 +190,7 @@
 # ============================================================================
 
 import argparse
+import datetime as dt
 import json
 import logging
 import os
@@ -317,6 +318,77 @@ def compute_statistic(
 #  2. filter 算子 — 条件筛选
 # ============================================================================
 
+# ── datetime 多格式容错解析 ─────────────────────────────────────────
+# 用户的日期时间格式可能千奇百怪（"2020-12-19" / "2020-12-19 15:19:27" /
+# "2020-12-19 15:19:27.000000" / "2020/12/19" / ISO 8601 等），
+# 这里枚举常见格式逐一尝试，匹配到第一个成功就返回。
+
+_DATETIME_FORMATS = [
+    "%Y-%m-%d %H:%M:%S.%f",      # 2020-12-19 15:19:27.000000
+    "%Y-%m-%d %H:%M:%S",         # 2020-12-19 15:19:27
+    "%Y-%m-%d %H:%M",            # 2020-12-19 15:19
+    "%Y-%m-%d",                  # 2020-12-19
+    "%Y/%m/%d %H:%M:%S.%f",      # 2020/12/19 15:19:27.000000
+    "%Y/%m/%d %H:%M:%S",         # 2020/12/19 15:19:27
+    "%Y/%m/%d",                  # 2020/12/19
+    "%Y-%m-%dT%H:%M:%S.%f",      # ISO 8601 with microseconds
+    "%Y-%m-%dT%H:%M:%S",         # ISO 8601
+    "%Y%m%d",                    # 20201219
+]
+
+
+def _try_parse_datetime(value: Any) -> Optional[dt.datetime]:
+    """
+    尝试将任意值解析为 Python datetime 对象。
+
+    支持：
+      - 已经是 datetime/date → 直接转换返回
+      - 字符串 → 用 _DATETIME_FORMATS 列表逐一尝试 strptime
+      - 数字 (int/float) → 视为 Unix 时间戳（秒级）
+
+    返回 None 表示无法解析为 datetime。
+    """
+    if value is None:
+        return None
+
+    # 已经是 datetime → 直接返回
+    if isinstance(value, dt.datetime):
+        return value
+
+    # date → 转为 datetime（时分秒归零）
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        return dt.datetime(value.year, value.month, value.day)
+
+    # 字符串 → 逐一尝试格式
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        for fmt in _DATETIME_FORMATS:
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    # 数字 → Unix 时间戳（秒）
+    if isinstance(value, (int, float)):
+        try:
+            return dt.datetime.fromtimestamp(float(value))
+        except (OSError, ValueError, OverflowError):
+            return None
+
+    return None
+
+
+def _column_is_temporal(col_dtype) -> bool:
+    """判断 Polars 列类型是否为日期/时间类型"""
+    return col_dtype in (
+        pl.Date, pl.Datetime,
+        pl.Datetime("ms"), pl.Datetime("us"), pl.Datetime("ns"),
+    )
+
+
 # 支持的比较运算符 → Polars 表达式映射
 _OP_MAP = {
     ">":  lambda col, val: pl.col(col) > val,
@@ -414,9 +486,31 @@ def apply_filter(
                     f"请在 condition.value 中提供比较值"
                 )
             compare_value = literal_value
-            logger.debug(
-                f"      条件 {i}: {col_name} {operator} {compare_value} (字面值)"
-            )
+
+            # ── 智能 datetime 适配 ──
+            # 如果被比较列是日期/时间类型，尝试把字符串值解析为 datetime。
+            # 支持 "2020-12-19" / "2020-12-19 15:19:27" /
+            # "2020-12-19 15:19:27.000000" 等多种格式（含缺毫秒/缺时分秒）。
+            col_dtype = df[col_name].dtype
+            if _column_is_temporal(col_dtype):
+                parsed = _try_parse_datetime(compare_value)
+                if parsed is not None:
+                    compare_value = parsed
+                    logger.debug(
+                        f"      条件 {i}: {col_name}({col_dtype}) "
+                        f"{operator} {compare_value} (datetime 自动解析)"
+                    )
+                else:
+                    logger.warning(
+                        f"      条件 {i}: 列 '{col_name}' 是 {col_dtype} 类型，"
+                        f"但比较值 '{compare_value}' 无法解析为日期时间，"
+                        f"将尝试直接比较（可能失败）"
+                    )
+            else:
+                logger.debug(
+                    f"      条件 {i}: {col_name} {operator} "
+                    f"{compare_value} (字面值)"
+                )
         else:
             # 从指定列计算统计量
             compare_value = compute_statistic(
@@ -1109,7 +1203,93 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
 
 
 # ============================================================================
-#  8. CLI 入口
+#  8. Excel 预览 — 列出子表、列名、类型（用于对齐用户意图）
+# ============================================================================
+
+def preview_excel(input_path: str, max_sample_rows: int = 3) -> str:
+    """
+    预览 Excel 文件结构：不处理数据，只列出所有子表名、列名、数据类型。
+
+    这个模式专门为 Agent/Skill 设计：在写 JSON 配置之前先跑一次，
+    确认列名和表名与用户意图一致，避免因列名拼写差异导致的运行时错误。
+
+    参数:
+        input_path       : Excel 文件路径
+        max_sample_rows  : 每列展示的样本值行数（默认 3）
+
+    返回:
+        格式化的预览报告字符串（可直接打印）
+    """
+    if not os.path.exists(input_path):
+        return f"[ERROR] 文件不存在: {input_path}"
+
+    # ── 发现子表 ──
+    try:
+        import fastexcel
+        wb = fastexcel.read_excel(input_path)
+        all_sheet_names: List[str] = wb.sheet_names
+    except Exception:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(input_path, read_only=True, data_only=True)
+            all_sheet_names = wb.sheetnames
+            wb.close()
+        except Exception as e:
+            return f"[ERROR] 无法读取 Excel 结构: {e}"
+
+    lines: List[str] = []
+    lines.append(f"\n{'='*60}")
+    lines.append(f"  Excel 文件预览: {input_path}")
+    lines.append(f"{'='*60}")
+    lines.append(f"  子表总数: {len(all_sheet_names)}")
+    lines.append("")
+
+    for idx, sheet_name in enumerate(all_sheet_names, 1):
+        lines.append(f"  [{idx}] Sheet: \"{sheet_name}\"")
+
+        try:
+            df = pl.read_excel(input_path, sheet_name=sheet_name)
+        except Exception as e:
+            lines.append(f"      [WARN] 读取失败: {e}")
+            lines.append("")
+            continue
+
+        lines.append(f"      行数: {df.height:,}  列数: {len(df.columns)}")
+
+        # 列名 + 类型 + 样本值
+        col_lines: List[str] = []
+        for col_name in df.columns:
+            col_dtype = df[col_name].dtype
+            # 取前几行非空样本值
+            sample_vals = (
+                df[col_name]
+                .drop_nulls()
+                .head(max_sample_rows)
+                .to_list()
+            )
+            sample_str = ", ".join(
+                str(v)[:50] for v in sample_vals
+            ) if sample_vals else "(全部为空)"
+            col_lines.append(
+                f"        · {col_name}  [{col_dtype}]  "
+                f"示例: {sample_str}"
+            )
+
+        # 列数太多时紧凑展示
+        if len(col_lines) <= 20:
+            lines.extend(col_lines)
+        else:
+            lines.extend(col_lines[:20])
+            lines.append(f"        ... 还有 {len(col_lines) - 20} 列（已截断）")
+
+        lines.append("")
+
+    lines.append(f"{'='*60}")
+    return "\n".join(lines)
+
+
+# ============================================================================
+#  9. CLI 入口
 # ============================================================================
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1135,7 +1315,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", "-c",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help="JSON 配置文件的路径",
     )
 
@@ -1156,6 +1337,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         metavar="PATH",
         help="生成一份示例配置文件到指定路径并退出",
+    )
+
+    parser.add_argument(
+        "--preview",
+        type=str,
+        metavar="PATH",
+        help="预览 Excel 文件结构（子表名+列名+类型+样本值），用于写配置前确认，不执行任何处理",
     )
 
     return parser
@@ -1248,6 +1436,17 @@ def main() -> None:
     if args.generate_example:
         _generate_example_config(args.generate_example)
         return
+
+    # ── 预览模式（不读配置，只看 Excel 结构）──
+    if args.preview:
+        report = preview_excel(args.preview)
+        print(report)
+        return
+
+    # ── config 参数必填（非 preview/generate-example 模式）──
+    if not args.config:
+        logger.error("需要指定 --config 或使用 --preview / --generate-example")
+        sys.exit(1)
 
     # ── 读取配置文件 ──
     if not os.path.exists(args.config):
