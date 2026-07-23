@@ -21,18 +21,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-# ─── 颜色方案 ───────────────────────────────────────────────
-CATEGORY_COLORS = {
-    "扫描枪": ("#FF4444", "#CC0000"),
-    "barcode scanner": ("#FF4444", "#CC0000"),
-    "护目镜": ("#4488FF", "#0044CC"),
-    "safety goggles": ("#4488FF", "#0044CC"),
-    "安全帽": ("#FF8800", "#CC6600"),
-    "helmet": ("#FF8800", "#CC6600"),
-    "手套": ("#44BB44", "#228822"),
-    "gloves": ("#44BB44", "#228822"),
-}
-FALLBACK_COLORS = [
+# ─── 颜色方案（全自动轮转，不硬编码类别） ──────────────────────
+COLOR_PALETTE = [
     ("#FF4444", "#CC0000"),  # Red
     ("#4488FF", "#0044CC"),  # Blue
     ("#44BB44", "#228822"),  # Green
@@ -40,6 +30,9 @@ FALLBACK_COLORS = [
     ("#CC44CC", "#880088"),  # Purple
     ("#FFCC00", "#CC9900"),  # Yellow
     ("#44CCCC", "#228888"),  # Teal
+    ("#FF6688", "#CC3355"),  # Pink
+    ("#8866FF", "#5533CC"),  # Indigo
+    ("#66CC88", "#339955"),  # Mint
 ]
 
 
@@ -91,14 +84,10 @@ def normalize_name(raw_name: str, known_categories: list) -> tuple:
 
 
 def get_color_for_category(category: str, index: int, total: int) -> tuple:
-    """为类别获取颜色，同一类别不同编号微调色调"""
+    """为每个不同类别自动分配颜色（基于类别名的 hash），同类别微调色调"""
     cat_lower = category.lower()
-    if cat_lower in CATEGORY_COLORS:
-        base_fill, base_outline = CATEGORY_COLORS[cat_lower]
-    else:
-        # 回退到轮转颜色
-        color_idx = hash(cat_lower) % len(FALLBACK_COLORS)
-        base_fill, base_outline = FALLBACK_COLORS[color_idx]
+    color_idx = hash(cat_lower) % len(COLOR_PALETTE)
+    base_fill, base_outline = COLOR_PALETTE[color_idx]
 
     fill_rgb = hex_to_rgb(base_fill)
     outline_rgb = hex_to_rgb(base_outline)
