@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-VLM 迭代标注 — 画框 + 存 JSON + 验证反馈工具
+Agent 视觉迭代标注 — 画框 + 存 JSON
 
 用法:
-    # Step 1: 获取图片尺寸
+    # 获取图片尺寸
     python draw_and_save.py --image input.jpg --get-size
 
-    # Step 3: 画框 + 存 JSON（交互模式，边画边迭代）
-    python draw_and_save.py --image input.jpg --json '{"objects":[...]}' --output annotated.jpg --json-output result.json
+    # 读取 JSON 画框（JSON 是 {prefix}_bbox.json 格式）
+    python draw_and_save.py --image input.jpg --json input_bbox.json --output input_annotated.jpg --json-output input_bbox.json
 
-    # Step 4: 应用调整（输入 VLM 返回的调整 JSON）
-    python draw_and_save.py --image input.jpg --json result.json --adjustments '[...]' --output annotated_v2.jpg --json-output result_v2.json
+    # 第一轮（从 JSON 字符串）
+    python draw_and_save.py --image input.jpg --json '{"objects":[...]}' --output input_annotated.jpg --json-output input_bbox.json
 """
 
 import json
@@ -271,43 +271,7 @@ def parse_vlm_json(vlm_response: str) -> list:
     raise ValueError(f"无法从 VLM 响应中解析 JSON: {text[:200]}...")
 
 
-def apply_adjustments(objects: list, adjustments: list) -> list:
-    """根据 VLM 的调整建议更新 bbox"""
-    updated = []
-    for obj in objects:
-        name = obj.get("name", "")
-        bbox = list(obj.get("bbox", [0, 0, 0, 0]))
-        color = obj.get("color", "")
-        history = obj.get("iteration_history", [])
-
-        # 查找是否有针对此物体的调整
-        adj = None
-        for a in adjustments:
-            if a.get("name", "").strip() == name.strip():
-                adj = a
-                break
-
-        if adj and adj.get("new_bbox"):
-            old_bbox = list(bbox)
-            bbox = adj["new_bbox"]
-            history.append({
-                "round": len(history) + 1,
-                "bbox_before": old_bbox,
-                "bbox_after": list(bbox),
-                "vlm_feedback": adj.get("direction", "") + f" ({adj.get('pixels', '?')}px)",
-            })
-
-        updated.append({
-            "name": name,
-            "bbox": list(bbox),
-            "color": color,
-            "iteration_history": history,
-        })
-
-    return updated
-
-
-def save_result_json(output_path: str, image_path: str, objects: list, prompt_objects: list, iterations: int):
+def save_result_json(output_path: str, image_path: str, objects: list, iterations: int):
     """保存最终 JSON 结果"""
     img = Image.open(image_path)
     result = {
@@ -316,7 +280,6 @@ def save_result_json(output_path: str, image_path: str, objects: list, prompt_ob
             "width": img.width,
             "height": img.height,
         },
-        "prompt_objects": prompt_objects,
         "iterations": iterations,
         "objects": objects,
     }
@@ -326,30 +289,23 @@ def save_result_json(output_path: str, image_path: str, objects: list, prompt_ob
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VLM 迭代标注工具")
+    parser = argparse.ArgumentParser(description="Agent 视觉迭代标注工具")
     parser.add_argument("--image", required=True, help="输入图片路径")
     parser.add_argument("--get-size", action="store_true", help="仅获取图片尺寸")
-    parser.add_argument("--json", help="VLM 返回的 JSON 字符串或已有 JSON 文件路径")
+    parser.add_argument("--json", help="JSON 文件路径 或 JSON 字符串")
     parser.add_argument("--output", default="annotated.jpg", help="标注图输出路径")
     parser.add_argument("--json-output", default="result.json", help="JSON 结果输出路径")
-    parser.add_argument("--adjustments", help="VLM 返回的调整建议 JSON")
-    parser.add_argument("--prompt-objects", default="", help="要检测的物体列表，逗号分隔")
-    parser.add_argument("--iterations", type=int, default=1, help="当前迭代轮次")
     args = parser.parse_args()
 
-    # Step 1: 获取尺寸
+    # 获取尺寸
     if args.get_size:
         size = get_image_size(args.image)
         print(json.dumps(size, ensure_ascii=False))
         return
 
-    # 检查图片存在
     if not os.path.exists(args.image):
         print(f"[ERROR] 图片不存在: {args.image}")
         sys.exit(1)
-
-    # Step 3/4: 画框
-    prompt_objects = [o.strip() for o in args.prompt_objects.split(",") if o.strip()] if args.prompt_objects else []
 
     # 加载 objects
     if args.json:
@@ -357,30 +313,19 @@ def main():
             with open(args.json, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 objects = data.get("objects", [])
-                if not prompt_objects:
-                    prompt_objects = data.get("prompt_objects", [])
                 iterations = data.get("iterations", 0) + 1
         else:
             objects = parse_vlm_json(args.json)
-            iterations = args.iterations
+            iterations = 1
     else:
         objects = []
         iterations = 0
 
-    # 应用调整
-    if args.adjustments:
-        try:
-            adj_data = json.loads(args.adjustments)
-            adjustments = adj_data.get("adjustments", []) if isinstance(adj_data, dict) else adj_data
-            objects = apply_adjustments(objects, adjustments)
-        except json.JSONDecodeError:
-            print("[WARN] 无法解析 adjustments JSON，跳过调整")
-
     # 画框
     draw_bboxes(args.image, objects, args.output)
 
-    # 存 JSON
-    save_result_json(args.json_output, args.image, objects, prompt_objects, iterations)
+    # 存 JSON（自动递增轮次）
+    save_result_json(args.json_output, args.image, objects, iterations)
 
 
 if __name__ == "__main__":
