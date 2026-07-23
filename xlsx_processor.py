@@ -390,6 +390,7 @@ def _column_is_temporal(col_dtype) -> bool:
 
 
 # 支持的比较运算符 → Polars 表达式映射
+# 注: "between" / "not_between" 的 value 是 [min, max] 列表，在 apply_filter 中特殊处理
 _OP_MAP = {
     ">":  lambda col, val: pl.col(col) > val,
     "<":  lambda col, val: pl.col(col) < val,
@@ -471,10 +472,11 @@ def apply_filter(
             )
 
         # 3) 校验运算符
-        if operator not in _OP_MAP:
+        is_between_op = operator in ("between", "not_between")
+        if operator not in _OP_MAP and not is_between_op:
             raise ValueError(
                 f"条件 {i}: 不支持的运算符 '{operator}'。"
-                f"可选: {list(_OP_MAP.keys())}"
+                f"可选: {list(_OP_MAP.keys())} + between, not_between"
             )
 
         # 4) 确定比较基准值
@@ -523,8 +525,42 @@ def apply_filter(
             )
 
         # 5) 构建 Polars 表达式
-        expr_fn = _OP_MAP[operator]
-        expressions.append(expr_fn(col_name, compare_value))
+        if is_between_op:
+            # ── between / not_between: value 必须是 [min, max] ──
+            if not isinstance(literal_value, (list, tuple)) or len(literal_value) != 2:
+                raise ValueError(
+                    f"条件 {i}: operator='{operator}' 要求 value 是 [min, max] 列表，"
+                    f"实际收到: {literal_value}"
+                )
+            lo, hi = literal_value[0], literal_value[1]
+
+            # datetime 适配：如果列是时间类型，把区间边界也解析为 datetime
+            col_dtype = df[col_name].dtype
+            if _column_is_temporal(col_dtype):
+                lo_dt = _try_parse_datetime(lo)
+                hi_dt = _try_parse_datetime(hi)
+                if lo_dt is not None and hi_dt is not None:
+                    lo, hi = lo_dt, hi_dt
+                    logger.debug(
+                        f"      条件 {i}: {col_name} {operator} "
+                        f"[{lo}, {hi}] (datetime 区间自动解析)"
+                    )
+                else:
+                    logger.warning(
+                        f"      条件 {i}: 列 '{col_name}' 是 {col_dtype}，"
+                        f"但区间边界 [{lo}, {hi}] 无法完全解析为 datetime"
+                    )
+
+            expr = pl.col(col_name).is_between(lo, hi, closed="both")
+            if operator == "not_between":
+                expr = ~expr
+            expressions.append(expr)
+            logger.info(
+                f"      条件 {i}: {col_name} {operator} [{lo}, {hi}]"
+            )
+        else:
+            expr_fn = _OP_MAP[operator]
+            expressions.append(expr_fn(col_name, compare_value))
 
     # ── 按 logic 组合表达式 ──
     if logic == "and":
@@ -1154,7 +1190,7 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
                                     f"Sheet '{sheet_name}', 操作 {i+1}, "
                                     f"条件 {j+1}: 缺少 'operator'"
                                 )
-                            elif cond["operator"] not in _OP_MAP:
+                            elif cond["operator"] not in _OP_MAP and cond["operator"] not in ("between", "not_between"):
                                 errors.append(
                                     f"Sheet '{sheet_name}', 操作 {i+1}, "
                                     f"条件 {j+1}: 不支持的运算符 "
